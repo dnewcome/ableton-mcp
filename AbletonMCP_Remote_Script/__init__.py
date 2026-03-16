@@ -228,7 +228,9 @@ class AbletonMCP(ControlSurface):
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name",
                                  "create_clip", "add_notes_to_clip", "set_clip_name",
-                                 "set_clip_follow_action",
+                                 "set_clip_follow_action", "set_clip_loop",
+                                 "set_scene_name",
+                                 "copy_clip_to_arrangement", "set_arrangement_clip_end",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback", "load_browser_item"]:
                 # Use a thread-safe approach with a response queue
@@ -260,12 +262,32 @@ class AbletonMCP(ControlSurface):
                             clip_index = params.get("clip_index", 0)
                             name = params.get("name", "")
                             result = self._set_clip_name(track_index, clip_index, name)
+                        elif command_type == "set_clip_loop":
+                            track_index = params.get("track_index", 0)
+                            clip_index  = params.get("clip_index", 0)
+                            loop_start  = params.get("loop_start", 0.0)
+                            loop_end    = params.get("loop_end", 4.0)
+                            result = self._set_clip_loop(track_index, clip_index, loop_start, loop_end)
                         elif command_type == "set_clip_follow_action":
                             track_index = params.get("track_index", 0)
                             clip_index = params.get("clip_index", 0)
                             action_time = params.get("action_time", 4.0)
                             action = params.get("action", "next")
                             result = self._set_clip_follow_action(track_index, clip_index, action_time, action)
+                        elif command_type == "set_scene_name":
+                            scene_index = params.get("scene_index", 0)
+                            name = params.get("name", "")
+                            result = self._set_scene_name(scene_index, name)
+                        elif command_type == "copy_clip_to_arrangement":
+                            track_index = params.get("track_index", 0)
+                            clip_index = params.get("clip_index", 0)
+                            arrangement_time = params.get("arrangement_time", 0.0)
+                            result = self._copy_clip_to_arrangement(track_index, clip_index, arrangement_time)
+                        elif command_type == "set_arrangement_clip_end":
+                            track_index = params.get("track_index", 0)
+                            arrangement_time = params.get("arrangement_time", 0.0)
+                            end_time = params.get("end_time", 0.0)
+                            result = self._set_arrangement_clip_end(track_index, arrangement_time, end_time)
                         elif command_type == "set_tempo":
                             tempo = params.get("tempo", 120.0)
                             result = self._set_tempo(tempo)
@@ -333,6 +355,11 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_browser_items_at_path":
                 path = params.get("path", "")
                 response["result"] = self.get_browser_items_at_path(path)
+            elif command_type == "get_arrangement_clips":
+                track_index = params.get("track_index", 0)
+                response["result"] = self._get_arrangement_clips(track_index)
+            elif command_type == "explore_arrangement_api":
+                response["result"] = self._explore_arrangement_api()
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -346,6 +373,149 @@ class AbletonMCP(ControlSurface):
     
     # Command implementations
     
+    def _set_scene_name(self, scene_index, name):
+        """Set the name of a scene"""
+        try:
+            if scene_index < 0 or scene_index >= len(self._song.scenes):
+                raise IndexError("Scene index out of range")
+            self._song.scenes[scene_index].name = name
+            return {"scene_index": scene_index, "name": self._song.scenes[scene_index].name}
+        except Exception as e:
+            self.log_message("Error setting scene name: " + str(e))
+            raise
+
+    def _copy_clip_to_arrangement(self, track_index, clip_index, arrangement_time):
+        """Copy a session view clip to the arrangement at the given beat position."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            clip_slot = track.clip_slots[clip_index]
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+            clip = clip_slot.clip
+            track.duplicate_clip_to_arrangement(clip, arrangement_time)
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "arrangement_time": arrangement_time,
+            }
+        except Exception as e:
+            self.log_message("Error copying clip to arrangement: " + str(e))
+            raise
+
+    def _set_arrangement_clip_end(self, track_index, arrangement_time, end_time):
+        """Extend an arrangement clip (identified by its start time) to end_time.
+
+        This stretches the clip's loop region so it fills the desired section length.
+        arrangement_time locates the clip; end_time is the desired end in beats.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            # Find the arrangement clip at or nearest to arrangement_time
+            target = None
+            for c in track.arrangement_clips:
+                if abs(c.start_time - arrangement_time) < 0.001:
+                    target = c
+                    break
+            if target is None:
+                raise Exception("No arrangement clip found at time {}".format(arrangement_time))
+            section_length = float(end_time) - float(arrangement_time)
+            target.looping = True
+            # Try setting length directly to extend the arrangement footprint,
+            # falling back to loop_end if length is not writable.
+            try:
+                target.length = section_length
+            except Exception:
+                target.loop_end = section_length
+            return {
+                "arrangement_time": arrangement_time,
+                "end_time": target.end_time,
+                "length": target.length,
+                "loop_end": target.loop_end,
+            }
+        except Exception as e:
+            self.log_message("Error setting arrangement clip end: " + str(e))
+            raise
+
+    def _get_arrangement_clips(self, track_index):
+        """Get all clips in arrangement view for a track."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            clips = []
+            for clip in track.arrangement_clips:
+                clip_info = {
+                    "name": clip.name,
+                    "start_time": clip.start_time,
+                    "end_time": clip.end_time,
+                    "length": clip.length,
+                }
+                for attr in ["loop_start", "loop_end", "looping"]:
+                    try:
+                        clip_info[attr] = getattr(clip, attr)
+                    except Exception:
+                        pass
+                clips.append(clip_info)
+            return {"track_index": track_index, "track_name": track.name, "clips": clips}
+        except Exception as e:
+            self.log_message("Error getting arrangement clips: " + str(e))
+            raise
+
+    def _explore_arrangement_api(self):
+        """Probe the Live API for arrangement view capabilities."""
+        keywords = ["arrangement", "duplicate", "time", "position", "punch", "record", "overdub"]
+
+        def probe(obj, label):
+            found = {}
+            for kw in keywords:
+                matches = [a for a in dir(obj) if kw.lower() in a.lower()]
+                if matches:
+                    found[kw] = matches
+            # Also try direct access of known arrangement properties
+            for attr in ["arrangement_clips", "can_jump_to_position",
+                         "current_song_time", "loop_start", "loop_length",
+                         "is_playing", "overdub", "record_mode"]:
+                try:
+                    found["__" + attr] = str(getattr(obj, attr))
+                except Exception as e:
+                    found["__" + attr] = "error: " + str(e)
+            return {label: found}
+
+        result = {}
+        result.update(probe(self._song, "song"))
+
+        if len(self._song.tracks) > 0:
+            track = self._song.tracks[0]
+            result.update(probe(track, "track[0]"))
+
+            # Also check if track has arrangement clips
+            try:
+                arr_clips = track.arrangement_clips
+                clip_info = []
+                for c in arr_clips:
+                    clip_info.append({
+                        "name": c.name,
+                        "start_time": c.start_time,
+                        "end_time": c.end_time,
+                        "length": c.length,
+                    })
+                result["arrangement_clips"] = clip_info
+            except Exception as e:
+                result["arrangement_clips"] = "error: " + str(e)
+
+            # Check clip methods
+            if len(track.clip_slots) > 0 and track.clip_slots[0].has_clip:
+                clip = track.clip_slots[0].clip
+                result.update(probe(clip, "clip"))
+
+        return result
+
     def _get_session_info(self):
         """Get information about the current session"""
         try:
@@ -557,6 +727,26 @@ class AbletonMCP(ControlSurface):
     
     # Live API follow action integers: 0=No Action, 1=Stop, 2=Play Again,
     # 3=Play Previous, 4=Play Next, 5=Play First, 6=Play Last, 7=Any, 8=Other
+    def _set_clip_loop(self, track_index, clip_index, loop_start, loop_end):
+        """Enable looping on a session view clip with the given loop region."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            clip_slot = track.clip_slots[clip_index]
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+            clip = clip_slot.clip
+            clip.looping    = True
+            clip.loop_start = float(loop_start)
+            clip.loop_end   = float(loop_end)
+            return {"looping": clip.looping, "loop_start": clip.loop_start, "loop_end": clip.loop_end}
+        except Exception as e:
+            self.log_message("Error setting clip loop: " + str(e))
+            raise
+
     FOLLOW_ACTION_MAP = {
         "stop":  1,
         "loop":  2,
