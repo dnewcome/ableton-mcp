@@ -355,6 +355,12 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_browser_items_at_path":
                 path = params.get("path", "")
                 response["result"] = self.get_browser_items_at_path(path)
+            elif command_type == "get_scene_names":
+                response["result"] = self._get_scene_names()
+            elif command_type == "get_clip_notes":
+                track_index = params.get("track_index", 0)
+                clip_index  = params.get("clip_index", 0)
+                response["result"] = self._get_clip_notes(track_index, clip_index)
             elif command_type == "get_arrangement_clips":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_arrangement_clips(track_index)
@@ -373,6 +379,41 @@ class AbletonMCP(ControlSurface):
     
     # Command implementations
     
+    def _get_scene_names(self):
+        """Return name and index for every scene."""
+        return [{"index": i, "name": scene.name} for i, scene in enumerate(self._song.scenes)]
+
+    def _get_clip_notes(self, track_index, clip_index):
+        """Return MIDI notes for a session view clip."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            clip_slot = track.clip_slots[clip_index]
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+            clip = clip_slot.clip
+            if not clip.is_midi_clip:
+                raise Exception("Not a MIDI clip")
+            # get_notes(from_time, from_pitch, time_span, pitch_span)
+            raw = clip.get_notes(0, 0, clip.loop_end, 128)
+            notes = [
+                {
+                    "pitch":    n[0],
+                    "start":    n[1],
+                    "duration": n[2],
+                    "velocity": n[3],
+                    "mute":     bool(n[4]),
+                }
+                for n in raw
+            ]
+            return {"notes": notes, "length": clip.length, "loop_end": clip.loop_end}
+        except Exception as e:
+            self.log_message("Error getting clip notes: " + str(e))
+            raise
+
     def _set_scene_name(self, scene_index, name):
         """Set the name of a scene"""
         try:
@@ -550,11 +591,22 @@ class AbletonMCP(ControlSurface):
                 clip_info = None
                 if slot.has_clip:
                     clip = slot.clip
+                    fa_enabled = False
+                    try:
+                        fa_enabled = clip.follow_actions_enabled
+                    except Exception:
+                        pass
                     clip_info = {
                         "name": clip.name,
                         "length": clip.length,
                         "is_playing": clip.is_playing,
-                        "is_recording": clip.is_recording
+                        "is_recording": clip.is_recording,
+                        "looping": clip.looping,
+                        "loop_start": clip.loop_start,
+                        "loop_end": clip.loop_end,
+                        "follow_action_a": clip.follow_action_a,
+                        "follow_action_time": clip.follow_action_time,
+                        "follow_actions_enabled": fa_enabled,
                     }
                 
                 clip_slots.append({
