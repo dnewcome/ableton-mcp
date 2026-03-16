@@ -226,8 +226,9 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
             # Commands that modify Live's state should be scheduled on the main thread
-            elif command_type in ["create_midi_track", "set_track_name", 
-                                 "create_clip", "add_notes_to_clip", "set_clip_name", 
+            elif command_type in ["create_midi_track", "set_track_name",
+                                 "create_clip", "add_notes_to_clip", "set_clip_name",
+                                 "set_clip_follow_action",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback", "load_browser_item"]:
                 # Use a thread-safe approach with a response queue
@@ -259,6 +260,12 @@ class AbletonMCP(ControlSurface):
                             clip_index = params.get("clip_index", 0)
                             name = params.get("name", "")
                             result = self._set_clip_name(track_index, clip_index, name)
+                        elif command_type == "set_clip_follow_action":
+                            track_index = params.get("track_index", 0)
+                            clip_index = params.get("clip_index", 0)
+                            action_time = params.get("action_time", 4.0)
+                            action = params.get("action", "next")
+                            result = self._set_clip_follow_action(track_index, clip_index, action_time, action)
                         elif command_type == "set_tempo":
                             tempo = params.get("tempo", 120.0)
                             result = self._set_tempo(tempo)
@@ -548,6 +555,58 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting clip name: " + str(e))
             raise
     
+    # Live API follow action integers: 0=No Action, 1=Stop, 2=Play Again,
+    # 3=Play Previous, 4=Play Next, 5=Play First, 6=Play Last, 7=Any, 8=Other
+    FOLLOW_ACTION_MAP = {
+        "stop":  1,
+        "loop":  2,
+        "prev":  3,
+        "next":  4,
+        "first": 5,
+        "last":  6,
+        "any":   7,
+        "other": 8,
+    }
+
+    def _set_clip_follow_action(self, track_index, clip_index, action_time, action):
+        """Set a clip's follow action so it advances to the next scene after action_time beats."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+
+            clip_slot = track.clip_slots[clip_index]
+
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+
+            clip = clip_slot.clip
+            action_int = self.FOLLOW_ACTION_MAP.get(action, 4)
+
+            clip.follow_action_time = float(action_time)
+            clip.follow_action_a = action_int
+            clip.follow_action_a_chance = 100
+            clip.follow_action_b_chance = 0
+            # follow_actions_enabled was added in Live 11
+            enabled_status = "not attempted"
+            try:
+                clip.follow_actions_enabled = True
+                enabled_status = str(clip.follow_actions_enabled)
+            except Exception as e:
+                enabled_status = "error: {} {}".format(type(e).__name__, str(e))
+
+            return {
+                "action": action,
+                "action_time": clip.follow_action_time,
+            }
+        except Exception as e:
+            self.log_message("Error setting clip follow action: " + str(e))
+            raise
+
     def _set_tempo(self, tempo):
         """Set the tempo of the session"""
         try:
